@@ -170,11 +170,14 @@ async def _run(
     if not skip_breach:
         try:
             from sources.breach_lookup import enrich_breach_entities
-            console.print("• Breach exposure (XposedOrNot + LeakCheck)…")
+            console.print("• Breach exposure (XposedOrNot + LeakCheck, e-mail and handles)…")
             _, _breach_stats = await enrich_breach_entities(extraction_results, inv_uuid)
             console.print(
                 f"  [green]done[/green] — xposedornot: {_breach_stats.get('xposedornot')}, "
-                f"leakcheck: {_breach_stats.get('leakcheck')}"
+                f"leakcheck: {_breach_stats.get('leakcheck')}, "
+                f"handles: {_breach_stats.get('handles_breached', 0)} hit(s) of "
+                f"{_breach_stats.get('handles_checked', 0)}, "
+                f"{_breach_stats.get('breach_edges', 0)} graph edge(s)"
             )
         except Exception as exc:
             console.print(f"  [red]failed:[/red] {exc}")

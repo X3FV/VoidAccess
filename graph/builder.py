@@ -110,6 +110,9 @@ _ENTITY_TYPE_TO_NODE_TYPE: dict[str, str] = {
     "ONION_URL":             NODE_TYPES.ONION_URL,
     "EMAIL_ADDRESS":         NODE_TYPES.EMAIL_ADDRESS,
     "PGP_KEY_BLOCK":         NODE_TYPES.PGP_KEY,
+    # Breach-corpus hits (sources/breach_lookup.py): a node per breach, so an
+    # EXPOSED_IN edge is a real, persisted graph edge rather than report text.
+    "BREACH_NAME":           NODE_TYPES.BREACH,
     "CVE_NUMBER":            NODE_TYPES.CVE,
     "CVE":                   "vulnerability",
     "PASTE_URL":             NODE_TYPES.PASTE,

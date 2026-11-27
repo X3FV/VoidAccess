@@ -67,6 +67,8 @@ voidaccess export <id> --format stix     # stix, misp, sigma, yara, snort, suric
 
 No Tor or LLM key yet? `voidaccess investigate "LockBit ransomware" --no-llm --no-tor --depth shallow` runs a clearnet-only pass. For the full stack (PostgreSQL, Tor, API and web UI) with Docker Compose, see the [self-hosting guide](docs/self-hosting.md). Python 3.10+.
 
+Add `--deep-investigation` for multi-hop work: after the first pass the engine re-searches the top actors and IOCs it found, and what a hop finds becomes the next hop's pivots. It is the heaviest mode — `VOIDACCESS_DEEP_HOPS` (default 2) and `VOIDACCESS_DEEP_MAX_PAGES` (default 20 pages per run) bound it, which matters on a Raspberry Pi or any single-box self-host.
+
 <details>
 <summary><b>CLI reference</b></summary>
 

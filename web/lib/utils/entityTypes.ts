@@ -93,6 +93,11 @@ export const ENTITY_TYPE_CONFIG: Record<string, {
     color: "var(--bg-raised)",
     textColor: "var(--text-secondary)"
   },
+  "BREACH_NAME": {
+    label: "Breach",
+    color: "var(--bg-raised)",
+    textColor: "var(--danger)"
+  },
 };
 
 export function getEntityTypeConfig(rawType: string) {

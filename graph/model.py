@@ -32,6 +32,11 @@ class NODE_TYPES:
     ORGANIZATION = "Organization"
     DOMAIN = "Domain"
     DATE = "Date"
+    # Breach-corpus hits (breach names / stealer-log corpora).  One node per
+    # breach, connected to the identifier it exposed by an EXPOSED_IN edge, so
+    # "which handles and addresses share a breach" is a graph query rather than
+    # a list in a report.  Produced by sources/breach_lookup.py.
+    BREACH = "Breach"
     # Credential / token nodes — high-severity IOC.  All extracted
     # credential types (AWS / GitHub / Slack / Discord / JWT / Google /
     # Stripe / generic API key / stealer-log URL) map to this single
@@ -93,6 +98,11 @@ class EDGE_TYPES:
     TARGETS = "TARGETS"                         # actor/campaign targeted an org
     EXPLOITS = "EXPLOITS"                       # malware/actor exploits a CVE
     COMMUNICATES_WITH = "COMMUNICATES_WITH"     # C2 / host communication
+    # Breach-corpus exposure: an e-mail address or handle appeared in the named
+    # breach (or stealer-log corpus).  Written by sources/breach_lookup.py with
+    # the confidence the exposure check assigned; every edge points at a
+    # BREACH_NAME entity node.
+    EXPOSED_IN = "EXPOSED_IN"
 
 
 # Metadata for typed relationships lives with the canonical graph vocabulary.
@@ -115,6 +125,7 @@ RELATIONSHIP_TYPE_STIX: dict[str, str] = {
     EDGE_TYPES.EXPLOITS: "exploits",
     EDGE_TYPES.COMMUNICATES_WITH: "communicates-with",
     EDGE_TYPES.CONTROLS: "related-to",
+    EDGE_TYPES.EXPOSED_IN: "related-to",
 }
 
 # Only typed LLM relationships need endpoint compatibility validation.  The

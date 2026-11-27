@@ -91,6 +91,9 @@ class RelationshipType(str, enum.Enum):
     TARGETS = "TARGETS"                 # actor/campaign targeted an organization
     EXPLOITS = "EXPLOITS"               # malware/actor exploits a vulnerability
     COMMUNICATES_WITH = "COMMUNICATES_WITH"  # host/malware C2 communication
+    # Breach-corpus exposure (sources/breach_lookup.py): an identifier appeared
+    # in a named breach.  The target entity is a BREACH_NAME node.
+    EXPOSED_IN = "EXPOSED_IN"
 
 
 # ---------------------------------------------------------------------------

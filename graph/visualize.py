@@ -43,6 +43,7 @@ _NODE_COLORS: dict[str, str] = {
     NODE_TYPES.EMAIL_ADDRESS:     "#2ecc71",  # green
     NODE_TYPES.PGP_KEY:           "#2ecc71",  # green
     NODE_TYPES.PASTE:             "#95a5a6",  # grey
+    NODE_TYPES.BREACH:            "#e05252",  # crimson — breach exposure
 }
 
 _DEFAULT_COLOR = "#bdc3c7"  # light grey fallback

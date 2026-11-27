@@ -83,6 +83,17 @@ def run(
         ),
     ),
     depth: str = typer.Option("normal", "--depth", help="shallow | normal | deep"),
+    deep_investigation: bool = typer.Option(
+        False,
+        "--deep-investigation",
+        help=(
+            "Multi-hop mode: after the first pass, hunt the top actors and IOCs it "
+            "found with their own targeted search, and let what a hop finds become "
+            "the next hop's pivots. The heaviest and slowest mode — bounded by "
+            "VOIDACCESS_DEEP_HOPS / _PIVOTS / _PAGES_PER_PIVOT / _MAX_PAGES "
+            "(defaults 2 hops, 3 pivots, 4 pages per pivot, 20 pages per run)."
+        ),
+    ),
     fmt: str = typer.Option("both", "--format", help="json | md | both"),
     quiet: bool = typer.Option(
         False,
@@ -283,6 +294,7 @@ def run(
                 events_jsonl=events_jsonl,
                 cancel_token=token,
                 trace=True if trace else None,
+                deep_investigation=deep_investigation,
             )
         )
     except DatabaseSchemaError as exc:
@@ -399,6 +411,7 @@ INVESTIGATION_STEPS = [
     "Scraping pages",
     "Discovering seeds",
     "Extracting entities",
+    "Investigating pivots",
     "Enriching intelligence",
     "Enriching domains",
     "Enriching hashes",
@@ -619,6 +632,7 @@ async def _run_investigation(
     sinks: Optional[list] = None,
     cancel_token: Optional["cancel.CancelToken"] = None,
     trace: Optional[bool] = None,
+    deep_investigation: bool = False,
 ) -> None:
     """Run the pipeline, reporting progress to the Rich display and any extra
     sinks (``events_jsonl`` path, or ``sinks`` such as a ``CallbackSink``).
@@ -655,7 +669,8 @@ async def _run_investigation(
         emitter.add_sink(sink)
     try:
         await _run_investigation_impl(
-            query, out_dir, model, no_tor, no_llm, depth, fmt, quiet, emitter
+            query, out_dir, model, no_tor, no_llm, depth, fmt, quiet, emitter,
+            deep_investigation=deep_investigation,
         )
     except BaseException as exc:
         is_cancel = isinstance(
@@ -704,6 +719,7 @@ async def _run_investigation_impl(
     fmt: str,
     quiet: bool,
     emitter: Any,
+    deep_investigation: bool = False,
 ) -> None:
     from progress import Stage
     from progress import trace as _trace
@@ -1547,6 +1563,51 @@ async def _run_investigation_impl(
         actors_found=_extracted_actors,
     )
 
+    # --- Step 5.5 — deep investigation (multi-hop pivot passes) -----------
+    # Opt-in: re-enter search → scrape → extract on the highest-signal entities
+    # the first pass found, *before* enrichment, so everything a hop discovers
+    # is enriched and graphed exactly like the first pass's results.
+    # analysis/deep_investigation.py owns the selection rules and the budget;
+    # _run_deep_passes owns the network.
+    deep_report: dict[str, Any] = {"enabled": False}
+    if deep_investigation:
+        cancel.checkpoint("deep")
+        _metric_start("deep_investigation")
+        display.update_step("Investigating pivots", "active")
+        try:
+            extraction_results, deep_report = await cancel.run_cancellable(
+                _run_deep_passes(
+                    investigation_id=investigation_id,
+                    inv_uuid=inv_uuid,
+                    query=refined,
+                    llm=llm,
+                    no_tor=no_tor,
+                    extraction_results=extraction_results,
+                    scraped_pages=scraped_pages,
+                    display=display,
+                    sqlite_adapter=sqlite_adapter,
+                    max_workers=_preset_workers(preset, "max_workers", SCRAPE_WORKERS_ENV),
+                    extract_concurrency=_preset_workers(
+                        preset, "extract_concurrency", EXTRACT_CONCURRENCY_ENV
+                    ),
+                ),
+                "deep",
+            )
+            display.update_step(
+                "Investigating pivots",
+                "ok",
+                f"{deep_report.get('pivots_investigated', 0)} pivot(s), "
+                f"{deep_report.get('pages_added', 0)} page(s), "
+                f"{deep_report.get('entities_added', 0)} entities",
+            )
+        except Exception as exc:
+            logger.warning("Deep investigation failed (non-fatal): %s", exc)
+            display.update_step("Investigating pivots", "fail", type(exc).__name__)
+            deep_report = {"enabled": True, "error": type(exc).__name__}
+        _metric_finish("deep_investigation")
+    else:
+        display.update_step("Investigating pivots", "skip", "--deep-investigation off")
+
     # --- Step 6 — enrich intelligence (OTX + IP) ---------------------------
     cancel.checkpoint("enrich")
     _metric_start("enrichment")
@@ -1713,9 +1774,11 @@ async def _run_investigation_impl(
         display.update_step("Breach exposure lookup", "active")
         try:
             from sources.breach_lookup import enrich_breach_entities
+            # 90 s, not 60: the step now covers handles as well as addresses, and
+            # both LeakCheck paths share one documented 1 RPS budget.
             extraction_results, _breach_stats = await asyncio.wait_for(
                 enrich_breach_entities(extraction_results, inv_uuid),
-                timeout=60,
+                timeout=90,
             )
             sources_used["xposedornot"] = source_entry(
                 "xposedornot",
@@ -1735,7 +1798,7 @@ async def _run_investigation_impl(
                 _trace.enrich_source(_sid, sources_used[_sid].get("status"), sources_used[_sid].get("count"))
             display.update_step("Breach exposure lookup", "ok")
         except asyncio.TimeoutError:
-            logger.warning("[%s] Breach lookup timed out after 60s", inv_uuid)
+            logger.warning("[%s] Breach lookup timed out after 90s", inv_uuid)
             sources_used["xposedornot"] = source_entry("xposedornot", timed_out=True)
             sources_used["leakcheck"] = source_entry("leakcheck", timed_out=True)
             _trace.enrich_source("xposedornot", "timeout")
@@ -2185,6 +2248,12 @@ async def _run_investigation_impl(
             filter_fallback["onion"] or filter_fallback["clearnet"],
             refined_restored,
         ),
+        # Breach-corpus exposure as flat rows — the same facts the graph carries
+        # as BREACH_NAME nodes and EXPOSED_IN edges, in a form CSV/JSON consumers
+        # and the Markdown report can read without traversing the graph.
+        "breach_exposure": _breach_rows(final_entities, final_relationships),
+        # Multi-hop mode: what was pivoted on, and what each hop added.
+        "deep_investigation": deep_report,
     }
 
     # Outputs are written to temp files and renamed into place only after the
@@ -2368,6 +2437,21 @@ def _rss_feed_items_capped() -> int:
         return 0
 
 
+def _breach_rows(entities: list[dict], relationships: list[dict]) -> list[dict]:
+    """Breach-corpus exposure rows for the report and the exports.
+
+    Never raises: a report must still be written if the breach module cannot be
+    imported or a row cannot be rendered.
+    """
+    try:
+        from sources.breach_lookup import breach_export_rows
+
+        return breach_export_rows(entities, relationships)
+    except Exception as exc:
+        logger.debug("breach exposure rows unavailable: %s", exc)
+        return []
+
+
 def _search_engines_report(summary: dict, results_found: int, no_tor: bool) -> dict:
     """The ``search_engines`` block of the JSON report (23B-B2)."""
     from search import engine_status
@@ -2457,6 +2541,243 @@ def _extra_fetch_links(
             tr.url_kept("fetch", link)
             extra.append({"link": link, "title": ""})
     return extra
+
+
+# ---------------------------------------------------------------------------
+# Deep investigation — multi-hop pivot passes (--deep-investigation)
+# ---------------------------------------------------------------------------
+
+
+async def _run_deep_passes(
+    *,
+    investigation_id: str,
+    inv_uuid: uuid.UUID,
+    query: str,
+    llm: Any,
+    no_tor: bool,
+    extraction_results: list,
+    scraped_pages: list[dict],
+    display: Any,
+    sqlite_adapter: Any,
+    max_workers: int,
+    extract_concurrency: int,
+) -> tuple[list, dict]:
+    """Search → scrape → extract on the top pivots, hop by hop.
+
+    Pivots are read back from the entities already stored for this
+    investigation (``analysis.deep_investigation.select_pivots``), so hop N can
+    pivot on what hop N-1 discovered.  Everything found lands in
+    *extraction_results* and *scraped_pages*, which is what makes the rest of
+    the pipeline — enrichment, graph, report — treat it like first-pass output.
+
+    Returns ``(extraction_results, report)`` where *report* is the
+    ``deep_investigation`` block of the JSON payload.
+    """
+    from analysis.deep_investigation import (
+        DeepBudget,
+        build_pivot_query,
+        deep_limits,
+        select_pivots,
+        summarize_hops,
+    )
+
+    limits = deep_limits()
+    budget = DeepBudget(max_pages=int(limits["max_pages"]))
+    hops: list[dict] = []
+    tried: set[str] = set()
+    seen_urls = {str(page.get("url") or "") for page in scraped_pages}
+
+    for hop in range(1, int(limits["hops"]) + 1):
+        cancel.checkpoint("deep")
+        entities = await asyncio.to_thread(
+            sqlite_adapter.get_entities, investigation_id, None, 2000
+        )
+        pivots = select_pivots(
+            entities,
+            excluded=tried,
+            base_query=query,
+            limit=int(limits["pivots_per_hop"]),
+        )
+        if not pivots:
+            break
+        display.update_step(
+            "Investigating pivots", "active", f"hop {hop}: {len(pivots)} pivot(s)"
+        )
+        hop_record: dict[str, Any] = {
+            "hop": hop, "pivots": [], "pages": 0, "entities": 0,
+        }
+        for pivot in pivots:
+            cancel.checkpoint("deep")
+            grant = budget.spend(int(limits["pages_per_pivot"]))
+            if grant <= 0:
+                break
+            tried.add(pivot.value.lower())
+            pivot_query = build_pivot_query(pivot, query)
+            pivot_record: dict[str, Any] = {
+                "value": pivot.value,
+                "entity_type": pivot.entity_type,
+                "query": pivot_query,
+                "score": pivot.score,
+                "pages": 0,
+                "entities": 0,
+            }
+            pages = await _deep_collect_pivot(
+                pivot_query=pivot_query,
+                page_cap=grant,
+                no_tor=no_tor,
+                llm=llm,
+                max_workers=max_workers,
+                seen_urls=seen_urls,
+                investigation_id=investigation_id,
+            )
+            if pages:
+                try:
+                    from extractor.pipeline import extract_entities_from_pages
+
+                    extracted = await cancel.run_cancellable(
+                        extract_entities_from_pages(
+                            pages=pages,
+                            investigation_id=inv_uuid,
+                            llm=llm,
+                            run_llm_extraction=llm is not None,
+                            max_concurrent=extract_concurrency,
+                            max_llm_pages=_max_llm_pages(),
+                        ),
+                        "deep",
+                    )
+                    extraction_results.extend(extracted)
+                    pivot_record["entities"] = sum(
+                        len(getattr(result, "entity_ids", []) or [])
+                        for result in extracted
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "deep: extraction failed for %r: %s", pivot_query, exc
+                    )
+                scraped_pages.extend(pages)
+                pivot_record["pages"] = len(pages)
+                hop_record["pages"] += len(pages)
+                hop_record["entities"] += pivot_record["entities"]
+            hop_record["pivots"].append(pivot_record)
+        if not hop_record["pivots"]:
+            break
+        hops.append(hop_record)
+
+    if hops:
+        # Resolve page ids for the new pages, so relationship provenance
+        # resolves exactly as it does for first-pass pages.
+        try:
+            missing = [
+                str(page.get("url") or "")
+                for page in scraped_pages
+                if page.get("page_id") is None
+            ]
+            page_ids = await asyncio.to_thread(_lookup_page_ids, missing)
+            for page in scraped_pages:
+                if page.get("page_id") is None:
+                    page_id = page_ids.get(page["url"])
+                    if page_id is not None:
+                        page["page_id"] = page_id
+        except Exception as exc:
+            logger.debug("deep: page id resolution failed: %s", exc)
+
+    return extraction_results, summarize_hops(hops, limits)
+
+
+async def _deep_collect_pivot(
+    *,
+    pivot_query: str,
+    page_cap: int,
+    no_tor: bool,
+    llm: Any,
+    max_workers: int,
+    seen_urls: set[str],
+    investigation_id: str,
+) -> list[dict]:
+    """Up to *page_cap* fresh pages for one pivot, gated and deduplicated.
+
+    With Tor, the pivot goes through the same engine fan-out the first pass
+    used and the pages are fetched by the same scraper.  Without Tor, the
+    clearnet side sources answer instead (RSS, GitHub, GitLab) and their content
+    is used as-is — ``--no-tor`` stays a zero-Tor guarantee.
+    """
+    from search.selection import select_diverse
+    from utils.content_dedup import deduplicate_page_records
+    from utils.content_safety import gate_pages
+
+    collected: list[dict] = []
+    if not no_tor:
+        links: list[dict] = []
+        try:
+            from search import get_search_results_async
+
+            links = await asyncio.to_thread(
+                get_search_results_async, pivot_query, max_workers, llm
+            )
+        except Exception as exc:
+            logger.debug("deep: search failed for %r: %s", pivot_query, exc)
+        candidates = [
+            link
+            for link in (links or [])
+            if str(link.get("link") or "") not in seen_urls
+        ]
+        picked, _rest = select_diverse(candidates, page_cap)
+        if picked:
+            try:
+                from scraper.scrape import scrape_multiple
+
+                batch = await cancel.run_cancellable(
+                    scrape_multiple(
+                        picked,
+                        max_workers=max_workers,
+                        investigation_id=investigation_id,
+                        extract_typed_relationships=False,
+                    ),
+                    "deep",
+                )
+            except Exception as exc:
+                logger.debug("deep: scrape failed for %r: %s", pivot_query, exc)
+                batch = {}
+            for url, text in (batch or {}).items():
+                if not text or url in seen_urls:
+                    continue
+                collected.append(
+                    {"url": url, "text": text, "source": "deep_pivot", "title": ""}
+                )
+    else:
+        for label, scraper in (
+            ("rss", _scrape_rss),
+            ("github", _scrape_github),
+            ("gitlab", _scrape_gitlab),
+        ):
+            try:
+                fetched = await scraper(pivot_query)
+            except Exception as exc:
+                logger.debug(
+                    "deep: %s source failed for %r: %s", label, pivot_query, exc
+                )
+                continue
+            for page in fetched or ():
+                url = str(page.get("url") or page.get("link") or "")
+                text = _clearnet_page_text(page)
+                if not url or not text or url in seen_urls:
+                    continue
+                collected.append(
+                    {
+                        "url": url,
+                        "text": text,
+                        "source": f"deep_{label}",
+                        "title": str(page.get("title") or ""),
+                    }
+                )
+
+    if not collected:
+        return []
+    collected, _dropped = gate_pages(collected)
+    collected = deduplicate_page_records(collected)[:page_cap]
+    for page in collected:
+        seen_urls.add(str(page.get("url") or ""))
+    return collected
 
 
 def _trace_filter(
@@ -2939,7 +3260,48 @@ def _render_markdown(payload: dict[str, Any]) -> str:
     lines.append(f"- {len(by_type.get('ONION_URL', []))} .onion URLs mapped")
     lines.append(f"- {len(entities)} entities total")
     lines.append(f"- {payload.get('seeds_discovered', 0)} new .onion seeds discovered")
+    breach_rows = payload.get("breach_exposure") or []
+    if breach_rows:
+        lines.append(
+            f"- {len(breach_rows)} breach exposure(s) across "
+            f"{len({row.get('identifier') for row in breach_rows})} identifier(s)"
+        )
     lines.append("")
+
+    if breach_rows:
+        lines.append("## Breach exposure")
+        lines.append("| Identifier | Type | Breach | Confidence |")
+        lines.append("|---|---|---|---|")
+        for row in breach_rows[:100]:
+            lines.append(
+                f"| {str(row.get('identifier') or '').replace('|', '/')} | "
+                f"{row.get('identifier_type') or ''} | "
+                f"{str(row.get('breach') or '').replace('|', '/')} | "
+                f"{(row.get('confidence') or 0):.2f} |"
+            )
+        if len(breach_rows) > 100:
+            lines.append(f"\n_…and {len(breach_rows) - 100} more (see JSON)_")
+        lines.append("")
+
+    deep = payload.get("deep_investigation") or {}
+    if deep.get("enabled"):
+        lines.append("## Deep investigation")
+        if deep.get("error"):
+            lines.append(f"- Stopped early: {deep['error']}")
+        lines.append(
+            f"- {deep.get('hops_run', 0)} of {deep.get('hops_requested', 0)} hop(s), "
+            f"{deep.get('pivots_investigated', 0)} pivot(s): "
+            f"{deep.get('pages_added', 0)} page(s), "
+            f"{deep.get('entities_added', 0)} entities"
+        )
+        for hop in deep.get("hops") or []:
+            for pivot in hop.get("pivots") or []:
+                lines.append(
+                    f"- hop {hop.get('hop')}: {pivot.get('entity_type')} "
+                    f"{pivot.get('value')} → {pivot.get('pages', 0)} page(s), "
+                    f"{pivot.get('entities', 0)} entities"
+                )
+        lines.append("")
 
     relevance = payload.get("relevance") or {}
     tiers = ("direct", "related", "background")
